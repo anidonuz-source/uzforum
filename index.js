@@ -148,8 +148,32 @@ function money(n) {
 function esc(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-function isAdmin(ctx) {
-  return ADMIN_CHAT_ID && String(ctx.from.id) === String(ADMIN_CHAT_ID);
+const EXTRA_ADMINS_KEY = 'uzforum_extra_admins';
+async function getExtraAdminIds() {
+  const raw = await kvGet(EXTRA_ADMINS_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+async function saveExtraAdminIds(list) {
+  await kvSet(EXTRA_ADMINS_KEY, JSON.stringify(list));
+}
+async function getAllAdminIds() {
+  const extra = await getExtraAdminIds();
+  const ids = extra.map(a => String(a.id));
+  if (ADMIN_CHAT_ID) ids.unshift(String(ADMIN_CHAT_ID));
+  return [...new Set(ids)];
+}
+async function isAdmin(ctx) {
+  const id = String(ctx.from.id);
+  if (ADMIN_CHAT_ID && id === String(ADMIN_CHAT_ID)) return true;
+  const extra = await getExtraAdminIds();
+  return extra.some(a => String(a.id) === id);
+}
+function isMainAdmin(ctx) {
+  return !!ADMIN_CHAT_ID && String(ctx.from.id) === String(ADMIN_CHAT_ID);
+}
+async function notifyAdmins(text, extra) {
+  const ids = await getAllAdminIds();
+  return Promise.all(ids.map(id => bot.telegram.sendMessage(id, text, extra).catch(() => {})));
 }
 
 /* ========================= menyular ========================= */
@@ -390,12 +414,10 @@ bot.action(/^confirm_buy:(.+)$/, async (ctx) => {
     );
     await ctx.replyWithDocument(product.fileId, { caption: `📦 ${product.name}` }).catch(async () => {
       await ctx.reply('⚠️ Faylni yuborishda xatolik. Admin siz bilan qo\'lda bog\'lanadi.');
-      if (ADMIN_CHAT_ID) {
-        bot.telegram.sendMessage(ADMIN_CHAT_ID,
-          `⚠️ <b>Fayl avtomatik yuborilmadi</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\n🆔 <code>${order.id}</code>\nIltimos faylni qo'lda yuboring.`,
-          { parse_mode: 'HTML' }
-        ).catch(() => {});
-      }
+      notifyAdmins(
+        `⚠️ <b>Fayl avtomatik yuborilmadi</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\n🆔 <code>${order.id}</code>\nIltimos faylni qo'lda yuboring.`,
+        { parse_mode: 'HTML' }
+      );
     });
   } else {
     await ctx.editMessageText(
@@ -404,12 +426,10 @@ bot.action(/^confirm_buy:(.+)$/, async (ctx) => {
     );
   }
 
-  if (ADMIN_CHAT_ID) {
-    bot.telegram.sendMessage(ADMIN_CHAT_ID,
-      `🛒 <b>Yangi buyurtma (Telegram)</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\n💵 ${money(finalPrice)}${discount > 0 ? ` (chegirma: -${money(discount)})` : ''}\n🆔 <code>${order.id}</code>\n\n${product.fileId ? '📁 Fayl avtomatik yuborildi.' : "Mijozga mahsulotni qo'lda yetkazib bering."}`,
-      { parse_mode: 'HTML' }
-    ).catch(() => {});
-  }
+  notifyAdmins(
+    `🛒 <b>Yangi buyurtma (Telegram)</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\n💵 ${money(finalPrice)}${discount > 0 ? ` (chegirma: -${money(discount)})` : ''}\n🆔 <code>${order.id}</code>\n\n${product.fileId ? '📁 Fayl avtomatik yuborildi.' : "Mijozga mahsulotni qo'lda yetkazib bering."}`,
+    { parse_mode: 'HTML' }
+  );
 });
 
 /* ========================= 🧾 Buyurtmalarim ========================= */
@@ -445,8 +465,8 @@ async function getAllOrders() {
   return list;
 }
 
-function adminMenuKeyboard() {
-  return Markup.inlineKeyboard([
+function adminMenuKeyboard(mainAdmin) {
+  const rows = [
     [Markup.button.callback('📊 Statistika', 'admin_stats')],
     [Markup.button.callback('⏳ Kutilayotgan so\'rovlar', 'admin_pending')],
     [Markup.button.callback('👥 Foydalanuvchilar', 'admin_users')],
@@ -457,22 +477,68 @@ function adminMenuKeyboard() {
     [Markup.button.callback('📁 Mahsulotga fayl biriktirish', 'admin_attach_file')],
     [Markup.button.callback('🎟 Promo-kodlar', 'admin_promo')],
     [Markup.button.callback('📢 Hammaga xabar yuborish', 'admin_broadcast')]
-  ]);
+  ];
+  if (mainAdmin) rows.push([Markup.button.callback('🛡 Adminlar boshqaruvi', 'admin_manage_admins')]);
+  return Markup.inlineKeyboard(rows);
 }
 
 bot.command('admin', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  await ctx.replyWithHTML('⚙️ <b>Admin panel</b>\n\nKerakli bo\'limni tanlang:', adminMenuKeyboard());
+  if (!(await isAdmin(ctx))) return;
+  await ctx.replyWithHTML('⚙️ <b>Admin panel</b>\n\nKerakli bo\'limni tanlang:', adminMenuKeyboard(isMainAdmin(ctx)));
 });
 
 bot.action('admin_menu', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
-  await ctx.editMessageText('⚙️ Admin panel\n\nKerakli bo\'limni tanlang:', adminMenuKeyboard());
+  await ctx.editMessageText('⚙️ Admin panel\n\nKerakli bo\'limni tanlang:', adminMenuKeyboard(isMainAdmin(ctx)));
+});
+
+/* ========================= 🛡 adminlar boshqaruvi (faqat bosh admin) ========================= */
+async function renderAdminManagement() {
+  const extra = await getExtraAdminIds();
+  const lines = extra.length
+    ? extra.map(a => `👤 <code>${esc(a.id)}</code>${a.username ? ' (@' + esc(a.username) + ')' : ''}`).join('\n')
+    : "Hozircha qo'shimcha admin yo'q.";
+  const buttons = [[Markup.button.callback('➕ Yangi admin qo\'shish', 'admin_add_admin')]];
+  extra.forEach(a => buttons.push([Markup.button.callback(`🗑 ${a.username ? '@' + a.username : a.id} ni o'chirish`, `admin_remove_admin:${a.id}`)]));
+  buttons.push([Markup.button.callback('◀️ Orqaga', 'admin_menu')]);
+  return {
+    text: `🛡 <b>Adminlar boshqaruvi</b>\n━━━━━━━━━━━━━━━\n👑 Bosh admin: <code>${esc(ADMIN_CHAT_ID || '—')}</code>\n\n<b>Qo'shimcha adminlar:</b>\n${lines}`,
+    buttons
+  };
+}
+
+bot.action('admin_manage_admins', async (ctx) => {
+  if (!isMainAdmin(ctx)) return ctx.answerCbQuery('Faqat bosh admin uchun', { show_alert: true });
+  await ctx.answerCbQuery();
+  const { text, buttons } = await renderAdminManagement();
+  await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+});
+
+bot.action('admin_add_admin', async (ctx) => {
+  if (!isMainAdmin(ctx)) return ctx.answerCbQuery('Faqat bosh admin uchun', { show_alert: true });
+  await ctx.answerCbQuery();
+  ctx.session.flow = 'add_admin_wait';
+  await ctx.editMessageText(
+    "➕ Yangi adminni qo'shish uchun do'stingizning Telegram xabarini shu yerga <b>forward</b> qiling, yoki uning raqamli Telegram ID'sini yozing.\n\n" +
+    "<i>ID bilmasa, do'stingiz botga /start yozib, keyin sizga shu yerdan biror xabarini forward qilsin.</i>",
+    { parse_mode: 'HTML', ...cancelKeyboard() }
+  );
+});
+
+bot.action(/^admin_remove_admin:(.+)$/, async (ctx) => {
+  if (!isMainAdmin(ctx)) return ctx.answerCbQuery('Faqat bosh admin uchun', { show_alert: true });
+  const id = ctx.match[1];
+  const extra = await getExtraAdminIds();
+  const next = extra.filter(a => String(a.id) !== String(id));
+  await saveExtraAdminIds(next);
+  await ctx.answerCbQuery('Admin o\'chirildi');
+  const { text, buttons } = await renderAdminManagement();
+  await ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 });
 
 bot.action('admin_stats', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   await ctx.sendChatAction('typing');
   const users = await getAllUsers();
@@ -494,7 +560,7 @@ bot.action('admin_stats', async (ctx) => {
 });
 
 bot.action('admin_pending', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   await ctx.sendChatAction('typing');
   const orders = await getAllOrders();
@@ -518,7 +584,7 @@ bot.action('admin_pending', async (ctx) => {
 });
 
 bot.action('admin_users', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   await ctx.sendChatAction('typing');
   const users = (await getAllUsers()).sort((a, b) => new Date(b.joined || 0) - new Date(a.joined || 0));
@@ -535,7 +601,7 @@ bot.action('admin_users', async (ctx) => {
 });
 
 bot.action('admin_products', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   await ctx.sendChatAction('typing');
   const products = await listProducts();
@@ -553,7 +619,7 @@ bot.action('admin_products', async (ctx) => {
 
 /* ========================= 📁 mahsulotga fayl biriktirish ========================= */
 bot.action('admin_attach_file', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   await ctx.sendChatAction('typing');
   const products = await listProducts();
@@ -571,7 +637,7 @@ bot.action('admin_attach_file', async (ctx) => {
 });
 
 bot.action(/^attach_pick:(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   const productId = ctx.match[1];
   const product = await getProduct(productId);
   if (!product) return ctx.answerCbQuery('Topilmadi', { show_alert: true });
@@ -585,7 +651,7 @@ bot.action(/^attach_pick:(.+)$/, async (ctx) => {
 });
 
 bot.on('document', async (ctx) => {
-  if (!(isAdmin(ctx) && ctx.session.flow === 'attach_file_wait' && ctx.session.attachProductId)) return;
+  if (!((await isAdmin(ctx)) && ctx.session.flow === 'attach_file_wait' && ctx.session.attachProductId)) return;
   const productId = ctx.session.attachProductId;
   const product = await getProduct(productId);
   if (!product) {
@@ -608,14 +674,14 @@ bot.on('document', async (ctx) => {
 
 /* ========================= 🔍 foydalanuvchi qidirish + balansni sozlash ========================= */
 bot.action('admin_search_user', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   ctx.session.flow = 'search_user_wait';
   await ctx.editMessageText('🔍 Qidirilayotgan foydalanuvchi username\'ini yozing:', cancelKeyboard());
 });
 
 bot.action(/^adj_balance:(add|sub):(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   const [, mode, username] = ctx.match;
   ctx.session.flow = 'adjust_balance_wait';
   ctx.session.adjustUsername = username;
@@ -629,7 +695,7 @@ bot.action(/^adj_balance:(add|sub):(.+)$/, async (ctx) => {
 
 /* ========================= ➕ mahsulot qo'shish ========================= */
 bot.action('admin_add_product', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   ctx.session.newProduct = {};
   const buttons = CATEGORIES.map(c => [Markup.button.callback(c, `newprod_cat:${c}`)]);
@@ -638,7 +704,7 @@ bot.action('admin_add_product', async (ctx) => {
 });
 
 bot.action(/^newprod_cat:(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   ctx.session.newProduct = { cat: ctx.match[1] };
   ctx.session.flow = 'newprod_name';
   await ctx.answerCbQuery();
@@ -647,7 +713,7 @@ bot.action(/^newprod_cat:(.+)$/, async (ctx) => {
 
 /* ========================= 🗑 mahsulotni o'chirish ========================= */
 bot.action('admin_delete_product', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   const products = await listProducts();
   if (products.length === 0) {
@@ -659,7 +725,7 @@ bot.action('admin_delete_product', async (ctx) => {
 });
 
 bot.action(/^delprod_pick:(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   const product = await getProduct(ctx.match[1]);
   if (!product) return ctx.answerCbQuery('Topilmadi', { show_alert: true });
   await ctx.answerCbQuery();
@@ -673,7 +739,7 @@ bot.action(/^delprod_pick:(.+)$/, async (ctx) => {
 });
 
 bot.action(/^delprod_confirm:(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await kvDelete('product:' + ctx.match[1]);
   await ctx.answerCbQuery('O\'chirildi');
   await ctx.editMessageText('✅ Mahsulot o\'chirildi.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Admin panel', 'admin_menu')]]));
@@ -681,7 +747,7 @@ bot.action(/^delprod_confirm:(.+)$/, async (ctx) => {
 
 /* ========================= 🎟 promo-kodlar ========================= */
 bot.action('admin_promo', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   const promos = await getPromoCodes();
   const lines = promos.length
@@ -697,7 +763,7 @@ bot.action('admin_promo', async (ctx) => {
 });
 
 bot.action('promo_add', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   ctx.session.newPromo = {};
   ctx.session.flow = 'promo_code_wait';
   await ctx.answerCbQuery();
@@ -705,7 +771,7 @@ bot.action('promo_add', async (ctx) => {
 });
 
 bot.action(/^promo_toggle:(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   const promos = await getPromoCodes();
   const p = findPromo(promos, ctx.match[1]);
   if (!p) return ctx.answerCbQuery('Topilmadi', { show_alert: true });
@@ -723,7 +789,7 @@ bot.action(/^promo_toggle:(.+)$/, async (ctx) => {
 });
 
 bot.action(/^promo_delete:(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   const promos = await getPromoCodes();
   const idx = promos.findIndex(p => p.code.toLowerCase() === ctx.match[1].toLowerCase());
   if (idx !== -1) promos.splice(idx, 1);
@@ -742,7 +808,7 @@ bot.action(/^promo_delete:(.+)$/, async (ctx) => {
 });
 
 bot.action('admin_broadcast', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   ctx.session.flow = 'broadcast_wait';
   await ctx.editMessageText(
@@ -752,7 +818,7 @@ bot.action('admin_broadcast', async (ctx) => {
 });
 
 bot.action(/^broadcast_confirm$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   const text = ctx.session.broadcastText;
   if (!text) return ctx.answerCbQuery('Xabar topilmadi', { show_alert: true });
   await ctx.answerCbQuery('Yuborilmoqda...');
@@ -770,8 +836,8 @@ bot.action(/^broadcast_confirm$/, async (ctx) => {
 /* ========================= matnli xabarlarni qayta ishlash (topup summasi) ========================= */
 bot.on('text', async (ctx) => {
   /* ---- admin support javobi (forward qilingan xabarga reply) ---- */
-  if (isAdmin(ctx) && ctx.message.reply_to_message) {
-    const mapRaw = await kvGet('supportmap:' + ctx.message.reply_to_message.message_id);
+  if ((await isAdmin(ctx)) && ctx.message.reply_to_message) {
+    const mapRaw = await kvGet('supportmap:' + ctx.chat.id + ':' + ctx.message.reply_to_message.message_id);
     if (mapRaw) {
       const targetId = mapRaw;
       await bot.telegram.sendMessage(targetId, `💬 <b>Admin javobi:</b>\n\n${esc(ctx.message.text)}`, { parse_mode: 'HTML' }).catch(() => {});
@@ -782,18 +848,19 @@ bot.on('text', async (ctx) => {
   if (ctx.session.flow === 'support_wait') {
     ctx.session.flow = null;
     await ctx.reply('✅ Xabaringiz adminga yuborildi. Tez orada javob berishadi.', mainMenu());
-    if (ADMIN_CHAT_ID) {
+    const adminIds = await getAllAdminIds();
+    for (const adminId of adminIds) {
       const sent = await bot.telegram.sendMessage(
-        ADMIN_CHAT_ID,
+        adminId,
         `🆘 <b>Yordam so'rovi</b>\n👤 @${esc(ctx.from.username || '—')} (<code>${ctx.from.id}</code>)\n\n${esc(ctx.message.text)}\n\n<i>Javob berish uchun shu xabarga "Reply" qiling.</i>`,
         { parse_mode: 'HTML' }
       ).catch(() => null);
-      if (sent) await kvSet('supportmap:' + sent.message_id, String(ctx.from.id));
+      if (sent) await kvSet('supportmap:' + adminId + ':' + sent.message_id, String(ctx.from.id));
     }
     return;
   }
 
-  if (ctx.session.flow === 'broadcast_wait' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'broadcast_wait' && (await isAdmin(ctx))) {
     const text = ctx.message.text;
     ctx.session.broadcastText = text;
     ctx.session.flow = null;
@@ -829,8 +896,55 @@ bot.on('text', async (ctx) => {
     );
   }
 
+  /* ---- bosh admin: yangi admin qo'shish ---- */
+  if (ctx.session.flow === 'add_admin_wait' && isMainAdmin(ctx)) {
+    ctx.session.flow = null;
+    let newId = null, newUsername = null;
+    if (ctx.message.forward_from) {
+      newId = String(ctx.message.forward_from.id);
+      newUsername = ctx.message.forward_from.username || null;
+    } else {
+      const digits = (ctx.message.text || '').replace(/\D/g, '');
+      if (digits) newId = digits;
+    }
+    if (!newId) {
+      return ctx.replyWithHTML(
+        "⚠️ ID aniqlanmadi. Do'stingizning xabarini forward qiling yoki uning raqamli Telegram ID'sini yozing.",
+        cancelKeyboard()
+      );
+    }
+    if (String(newId) === String(ADMIN_CHAT_ID)) {
+      return ctx.replyWithHTML('⚠️ Bu allaqachon bosh admin.', mainMenu());
+    }
+    const extra = await getExtraAdminIds();
+    if (extra.some(a => String(a.id) === String(newId))) {
+      return ctx.replyWithHTML('⚠️ Bu foydalanuvchi allaqachon admin.', mainMenu());
+    }
+    extra.push({ id: newId, username: newUsername });
+    await saveExtraAdminIds(extra);
+    await ctx.replyWithHTML(
+      `✅ Yangi admin qo'shildi: <code>${esc(newId)}</code>${newUsername ? ' (@' + esc(newUsername) + ')' : ''}`,
+      mainMenu()
+    );
+    bot.telegram.setMyCommands(
+      [
+        { command: 'start', description: 'Botni ishga tushirish' },
+        { command: 'menu', description: 'Asosiy menyu' },
+        { command: 'help', description: 'Yordam' },
+        { command: 'admin', description: 'Admin panel' }
+      ],
+      { scope: { type: 'chat', chat_id: Number(newId) } }
+    ).catch(() => {});
+    bot.telegram.sendMessage(
+      newId,
+      "🛡 <b>Tabriklaymiz!</b> Siz UzForum botida admin etib tayinlandingiz.\n/admin buyrug'i orqali panelni oching.",
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
+    return;
+  }
+
   /* ---- admin: foydalanuvchi qidirish ---- */
-  if (ctx.session.flow === 'search_user_wait' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'search_user_wait' && (await isAdmin(ctx))) {
     ctx.session.flow = null;
     const uname = ctx.message.text.trim();
     const user = await getUserByUsername(uname);
@@ -849,7 +963,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (ctx.session.flow === 'adjust_balance_wait' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'adjust_balance_wait' && (await isAdmin(ctx))) {
     const amount = parseInt((ctx.message.text || '').replace(/\D/g, ''), 10);
     if (!amount || amount <= 0) {
       return ctx.replyWithHTML('⚠️ Musbat son yuboring. Masalan: <code>50000</code>', cancelKeyboard());
@@ -873,23 +987,23 @@ bot.on('text', async (ctx) => {
   }
 
   /* ---- admin: yangi mahsulot qo'shish (bosqichma-bosqich) ---- */
-  if (ctx.session.flow === 'newprod_name' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'newprod_name' && (await isAdmin(ctx))) {
     ctx.session.newProduct.name = ctx.message.text.trim();
     ctx.session.flow = 'newprod_price';
     return ctx.replyWithHTML('💵 Narxini yozing (so\'m). Bepul bo\'lsa <code>0</code> yozing:', cancelKeyboard());
   }
-  if (ctx.session.flow === 'newprod_price' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'newprod_price' && (await isAdmin(ctx))) {
     const price = parseInt((ctx.message.text || '').replace(/\D/g, ''), 10) || 0;
     ctx.session.newProduct.price = price;
     ctx.session.flow = 'newprod_desc';
     return ctx.replyWithHTML('📝 Qisqacha tavsif yozing:', cancelKeyboard());
   }
-  if (ctx.session.flow === 'newprod_desc' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'newprod_desc' && (await isAdmin(ctx))) {
     ctx.session.newProduct.desc = ctx.message.text.trim();
     ctx.session.flow = 'newprod_icon';
     return ctx.replyWithHTML('🗺️ Emoji ikonka yuboring (masalan 🗺️), yoki <code>-</code> deb yozing:', cancelKeyboard());
   }
-  if (ctx.session.flow === 'newprod_icon' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'newprod_icon' && (await isAdmin(ctx))) {
     const iconText = ctx.message.text.trim();
     const p = ctx.session.newProduct;
     const product = {
@@ -917,7 +1031,7 @@ bot.on('text', async (ctx) => {
   }
 
   /* ---- admin: promo-kod yaratish ---- */
-  if (ctx.session.flow === 'promo_code_wait' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'promo_code_wait' && (await isAdmin(ctx))) {
     const code = ctx.message.text.trim().toUpperCase();
     const promos = await getPromoCodes();
     if (findPromo(promos, code)) {
@@ -934,7 +1048,7 @@ bot.on('text', async (ctx) => {
       ])
     );
   }
-  if (ctx.session.flow === 'promo_value_wait' && isAdmin(ctx)) {
+  if (ctx.session.flow === 'promo_value_wait' && (await isAdmin(ctx))) {
     const value = parseInt((ctx.message.text || '').replace(/\D/g, ''), 10);
     if (!value || value <= 0) {
       return ctx.replyWithHTML('⚠️ Musbat son yuboring:', cancelKeyboard());
@@ -977,23 +1091,21 @@ bot.on('text', async (ctx) => {
       mainMenu()
     );
 
-    if (ADMIN_CHAT_ID) {
-      bot.telegram.sendMessage(ADMIN_CHAT_ID,
-        `💰 <b>Balans to'ldirish so'rovi</b>\n👤 ${esc(user.username)}\n💵 ${money(amount)}\n🆔 <code>${order.id}</code>`,
-        {
-          parse_mode: 'HTML',
-          ...Markup.inlineKeyboard([
-            Markup.button.callback('✅ Tasdiqlash', `topup_ok:${order.id}`),
-            Markup.button.callback('❌ Rad etish', `topup_no:${order.id}`)
-          ])
-        }
-      ).catch(() => {});
-    }
+    notifyAdmins(
+      `💰 <b>Balans to'ldirish so'rovi</b>\n👤 ${esc(user.username)}\n💵 ${money(amount)}\n🆔 <code>${order.id}</code>`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          Markup.button.callback('✅ Tasdiqlash', `topup_ok:${order.id}`),
+          Markup.button.callback('❌ Rad etish', `topup_no:${order.id}`)
+        ])
+      }
+    );
   }
 });
 
 bot.action(/^promo_type:(percent|fixed)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery();
   if (!ctx.session.newPromo) return ctx.answerCbQuery('Sessiya tugagan, qaytadan boshlang', { show_alert: true });
   ctx.session.newPromo.type = ctx.match[1];
   ctx.session.flow = 'promo_value_wait';
@@ -1006,7 +1118,7 @@ bot.action(/^promo_type:(percent|fixed)$/, async (ctx) => {
 
 /* ========================= admin: topup tasdiqlash / rad etish ========================= */
 bot.action(/^topup_ok:(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Ruxsat yo\'q');
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery('Ruxsat yo\'q');
   const orderId = ctx.match[1];
   const order = await getOrder(orderId);
   if (!order) return ctx.answerCbQuery('Topilmadi', { show_alert: true });
@@ -1031,7 +1143,7 @@ bot.action(/^topup_ok:(.+)$/, async (ctx) => {
 });
 
 bot.action(/^topup_no:(.+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Ruxsat yo\'q');
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery('Ruxsat yo\'q');
   const orderId = ctx.match[1];
   const order = await getOrder(orderId);
   if (!order) return ctx.answerCbQuery('Topilmadi', { show_alert: true });
@@ -1057,17 +1169,20 @@ bot.telegram.setMyCommands([
   { command: 'help', description: 'Yordam' }
 ]).catch(() => {});
 
-if (ADMIN_CHAT_ID) {
-  bot.telegram.setMyCommands(
-    [
-      { command: 'start', description: 'Botni ishga tushirish' },
-      { command: 'menu', description: 'Asosiy menyu' },
-      { command: 'help', description: 'Yordam' },
-      { command: 'admin', description: 'Admin panel' }
-    ],
-    { scope: { type: 'chat', chat_id: Number(ADMIN_CHAT_ID) } }
-  ).catch(() => {});
-}
+(async () => {
+  const adminIds = await getAllAdminIds();
+  for (const id of adminIds) {
+    bot.telegram.setMyCommands(
+      [
+        { command: 'start', description: 'Botni ishga tushirish' },
+        { command: 'menu', description: 'Asosiy menyu' },
+        { command: 'help', description: 'Yordam' },
+        { command: 'admin', description: 'Admin panel' }
+      ],
+      { scope: { type: 'chat', chat_id: Number(id) } }
+    ).catch(() => {});
+  }
+})();
 
 /* ========================= server (webhook) ========================= */
 const app = express();
