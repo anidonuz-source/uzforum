@@ -96,6 +96,9 @@ async function getProduct(id) {
   const raw = await kvGet('product:' + id);
   return raw ? JSON.parse(raw) : null;
 }
+async function saveProductRecord(product) {
+  await kvSet('product:' + product.id, JSON.stringify(product));
+}
 async function saveOrder(order) {
   await kvSet('order:' + order.id, JSON.stringify(order));
 }
@@ -115,6 +118,28 @@ async function listOrdersByUsername(username) {
 async function getPaymentCard() {
   const raw = await kvGet('uzforum_payment_card');
   return raw ? JSON.parse(raw) : { number: '', holder: '', bank: '' };
+}
+
+const CATEGORIES = ['Sborkalar', 'Plaginlar', 'Klientlar', 'Modlar', 'Resurspacklar'];
+const PROMO_LIST_KEY = 'uzforum_promo_codes';
+
+async function getPromoCodes() {
+  const raw = await kvGet(PROMO_LIST_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+async function savePromoCodes(list) {
+  await kvSet(PROMO_LIST_KEY, JSON.stringify(list));
+}
+function findPromo(list, code) {
+  return list.find(p => p.code.toLowerCase() === String(code || '').toLowerCase());
+}
+function promoLabel(p) {
+  return p.type === 'percent' ? `${p.value}%` : money(p.value);
+}
+function applyPromoDiscount(price, promo) {
+  if (!promo) return 0;
+  const raw = promo.type === 'percent' ? Math.round(price * promo.value / 100) : promo.value;
+  return Math.min(raw, price);
 }
 
 function money(n) {
@@ -191,9 +216,9 @@ bot.command('help', (ctx) => ctx.replyWithHTML(
   "/menu — asosiy menyuni ko'rsatish\n" +
   "👤 Hisobim — profil va balansni ko'rish\n" +
   "💰 Balans to'ldirish — balans to'ldirish so'rovi yuborish\n" +
-  "📦 Mahsulot sotib olish — katalogdan xarid qilish\n" +
-  "🧾 Buyurtmalarim — buyurtmalar tarixi\n\n" +
-  "Savol bo'lsa shu botga yozing, admin tez orada javob beradi."
+  "📦 Mahsulot sotib olish — kategoriya bo'yicha katalogdan xarid, promo-kod bilan chegirma olish mumkin\n" +
+  "🧾 Buyurtmalarim — buyurtmalar tarixi\n" +
+  "🆘 Yordam — adminga to'g'ridan-to'g'ri yozing, u shu yerda javob beradi\n"
 ));
 
 /* ========================= 👤 Hisobim ========================= */
@@ -233,22 +258,50 @@ bot.action('cancel_flow', async (ctx) => {
   ctx.session.flow = null;
   ctx.session.pendingProductId = null;
   ctx.session.broadcastText = null;
+  ctx.session.attachProductId = null;
+  ctx.session.buyPromo = null;
+  ctx.session.newProduct = null;
+  ctx.session.newPromo = null;
+  ctx.session.adjustUsername = null;
+  ctx.session.adjustMode = null;
   await ctx.answerCbQuery('Bekor qilindi');
   await ctx.editMessageText('✖️ Bekor qilindi.');
 });
 
-/* ========================= 📦 Mahsulot sotib olish ========================= */
+/* ========================= 📦 Mahsulot sotib olish (kategoriya bo'yicha) ========================= */
 bot.hears('📦 Mahsulot sotib olish', async (ctx) => {
   const user = await requireLinkedUser(ctx);
   if (!user) return;
-  await ctx.sendChatAction('typing');
-  const products = (await listProducts()).filter(p => p.isPremium !== false && p.price > 0);
-  if (products.length === 0) return ctx.reply("🙁 Hozircha sotuvda mahsulot yo'q.");
+  const buttons = CATEGORIES.map(c => [Markup.button.callback(`📂 ${c}`, `browse_cat:${c}`)]);
+  buttons.push([Markup.button.callback('🔎 Barcha mahsulotlar', 'browse_cat:all')]);
+  await ctx.replyWithHTML(`🛒 <b>Kategoriya tanlang</b>\n💰 Joriy balans: <b>${money(user.balance || 0)}</b>`, Markup.inlineKeyboard(buttons));
+});
 
+bot.action(/^browse_cat:(.+)$/, async (ctx) => {
+  const user = await getUserByTelegramId(String(ctx.from.id));
+  if (!user) return ctx.answerCbQuery('Hisob ulanmagan');
+  const cat = ctx.match[1];
+  await ctx.answerCbQuery();
+  await ctx.sendChatAction('typing');
+  let products = (await listProducts()).filter(p => p.isPremium !== false && p.price > 0);
+  if (cat !== 'all') products = products.filter(p => p.cat === cat);
+  if (products.length === 0) {
+    return ctx.editMessageText('🙁 Bu bo\'limda hozircha mahsulot yo\'q.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', 'back_to_cats')]]));
+  }
   const buttons = products.slice(0, 30).map(p => [
     Markup.button.callback(`${p.icon || '📦'} ${p.name} — ${money(p.price)}`, `buy:${p.id}`)
   ]);
-  await ctx.replyWithHTML(`🛒 <b>Mahsulotlar</b>\n💰 Joriy balans: <b>${money(user.balance || 0)}</b>\n\nBirini tanlang:`, Markup.inlineKeyboard(buttons));
+  buttons.push([Markup.button.callback('◀️ Orqaga', 'back_to_cats')]);
+  await ctx.editMessageText(`${cat === 'all' ? '🔎 Barcha mahsulotlar' : '📂 ' + cat}\n\nBirini tanlang:`, Markup.inlineKeyboard(buttons));
+});
+
+bot.action('back_to_cats', async (ctx) => {
+  const user = await getUserByTelegramId(String(ctx.from.id));
+  if (!user) return ctx.answerCbQuery('Hisob ulanmagan');
+  await ctx.answerCbQuery();
+  const buttons = CATEGORIES.map(c => [Markup.button.callback(`📂 ${c}`, `browse_cat:${c}`)]);
+  buttons.push([Markup.button.callback('🔎 Barcha mahsulotlar', 'browse_cat:all')]);
+  await ctx.editMessageText(`🛒 <b>Kategoriya tanlang</b>\n💰 Joriy balans: <b>${money(user.balance || 0)}</b>`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 });
 
 bot.action(/^buy:(.+)$/, async (ctx) => {
@@ -257,6 +310,9 @@ bot.action(/^buy:(.+)$/, async (ctx) => {
   if (!user) return ctx.answerCbQuery('Hisob ulanmagan');
   const product = await getProduct(productId);
   if (!product) return ctx.answerCbQuery('Mahsulot topilmadi', { show_alert: true });
+
+  ctx.session.pendingProductId = productId;
+  ctx.session.buyPromo = null;
 
   if ((user.balance || 0) < product.price) {
     await ctx.answerCbQuery();
@@ -270,9 +326,18 @@ bot.action(/^buy:(.+)$/, async (ctx) => {
     `🧾 Xaridni tasdiqlaysizmi?\n\n${product.icon || '📦'} ${product.name}\n💵 ${money(product.price)}\n\nBalansdan darhol yechib olinadi.`,
     Markup.inlineKeyboard([
       [Markup.button.callback('✅ Ha, sotib olaman', `confirm_buy:${product.id}`)],
+      [Markup.button.callback('🎟 Promo-kod kiritish', `buy_promo:${product.id}`)],
       [Markup.button.callback('✖️ Bekor qilish', 'cancel_flow')]
     ])
   );
+});
+
+bot.action(/^buy_promo:(.+)$/, async (ctx) => {
+  const productId = ctx.match[1];
+  ctx.session.flow = 'buy_promo_wait';
+  ctx.session.pendingProductId = productId;
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('🎟 Promo-kodni yozing:', cancelKeyboard());
 });
 
 bot.action(/^confirm_buy:(.+)$/, async (ctx) => {
@@ -282,21 +347,25 @@ bot.action(/^confirm_buy:(.+)$/, async (ctx) => {
   const product = await getProduct(productId);
   if (!product) return ctx.answerCbQuery('Mahsulot topilmadi', { show_alert: true });
 
-  if ((user.balance || 0) < product.price) {
+  const promo = ctx.session.buyPromo || null;
+  const discount = promo ? applyPromoDiscount(product.price, promo) : 0;
+  const finalPrice = Math.max(0, product.price - discount);
+
+  if ((user.balance || 0) < finalPrice) {
     await ctx.answerCbQuery();
     return ctx.editMessageText('❌ Balansingiz yetarli emas.');
   }
 
-  user.balance = (user.balance || 0) - product.price;
+  user.balance = (user.balance || 0) - finalPrice;
   const order = {
     id: 'o' + Date.now(),
     type: 'purchase',
     buyer: user.username,
-    items: [{ name: product.name, cat: product.cat, qty: 1, total: product.price, free: false }],
+    items: [{ name: product.name, cat: product.cat, qty: 1, total: finalPrice, free: false }],
     subtotal: product.price,
-    discount: 0,
-    promoCode: null,
-    total: product.price,
+    discount,
+    promoCode: promo ? promo.code : null,
+    total: finalPrice,
     receiptImage: null,
     paidWithBalance: true,
     status: 'approved',
@@ -308,16 +377,36 @@ bot.action(/^confirm_buy:(.+)$/, async (ctx) => {
 
   await saveUser(user);
   await saveOrder(order);
+  ctx.session.pendingProductId = null;
+  ctx.session.buyPromo = null;
 
   await ctx.answerCbQuery('Xarid amalga oshirildi ✅');
-  await ctx.editMessageText(
-    `✅ <b>"${esc(product.name)}"</b> sotib olindi!\n💰 Yangi balans: <b>${money(user.balance)}</b>\n\nAdmin tez orada siz bilan bog'lanib, mahsulotni yetkazib beradi.`,
-    { parse_mode: 'HTML' }
-  );
+
+  const discountLine = discount > 0 ? `🎟 Chegirma (${esc(promo.code)}): -${money(discount)}\n` : '';
+
+  if (product.fileId) {
+    await ctx.replyWithHTML(
+      `✅ <b>"${esc(product.name)}"</b> sotib olindi!\n${discountLine}💰 Yangi balans: <b>${money(user.balance)}</b>\n\n📁 Faylingiz quyida — yuklab oling:`
+    );
+    await ctx.replyWithDocument(product.fileId, { caption: `📦 ${product.name}` }).catch(async () => {
+      await ctx.reply('⚠️ Faylni yuborishda xatolik. Admin siz bilan qo\'lda bog\'lanadi.');
+      if (ADMIN_CHAT_ID) {
+        bot.telegram.sendMessage(ADMIN_CHAT_ID,
+          `⚠️ <b>Fayl avtomatik yuborilmadi</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\n🆔 <code>${order.id}</code>\nIltimos faylni qo'lda yuboring.`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+    });
+  } else {
+    await ctx.editMessageText(
+      `✅ <b>"${esc(product.name)}"</b> sotib olindi!\n${discountLine}💰 Yangi balans: <b>${money(user.balance)}</b>\n\nAdmin tez orada siz bilan bog'lanib, mahsulotni yetkazib beradi.`,
+      { parse_mode: 'HTML' }
+    );
+  }
 
   if (ADMIN_CHAT_ID) {
     bot.telegram.sendMessage(ADMIN_CHAT_ID,
-      `🛒 <b>Yangi buyurtma (Telegram)</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\n💵 ${money(product.price)}\n🆔 <code>${order.id}</code>\n\nMijozga mahsulotni qo'lda yetkazib bering.`,
+      `🛒 <b>Yangi buyurtma (Telegram)</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\n💵 ${money(finalPrice)}${discount > 0 ? ` (chegirma: -${money(discount)})` : ''}\n🆔 <code>${order.id}</code>\n\n${product.fileId ? '📁 Fayl avtomatik yuborildi.' : "Mijozga mahsulotni qo'lda yetkazib bering."}`,
       { parse_mode: 'HTML' }
     ).catch(() => {});
   }
@@ -338,12 +427,10 @@ bot.hears('🧾 Buyurtmalarim', async (ctx) => {
   await ctx.replyWithHTML('🧾 <b>So\'nggi buyurtmalaringiz</b>\n━━━━━━━━━━━━━━━\n' + lines.join('\n'));
 });
 
-/* ========================= 🆘 Yordam ========================= */
+/* ========================= 🆘 Yordam (ikki tomonlama chat) ========================= */
 bot.hears('🆘 Yordam', async (ctx) => {
-  await ctx.reply("🆘 Savolingiz bormi? Shu yerga yozing — admin tez orada javob beradi.");
-  if (ADMIN_CHAT_ID) {
-    bot.telegram.sendMessage(ADMIN_CHAT_ID, `🆘 Yordam so'rovi: @${ctx.from.username || '—'} (ID: ${ctx.from.id})`).catch(() => {});
-  }
+  ctx.session.flow = 'support_wait';
+  await ctx.replyWithHTML('🆘 Savolingizni yozing — admin shu yerga javob yozadi.', cancelKeyboard());
 });
 
 /* ========================= admin panel ========================= */
@@ -363,7 +450,12 @@ function adminMenuKeyboard() {
     [Markup.button.callback('📊 Statistika', 'admin_stats')],
     [Markup.button.callback('⏳ Kutilayotgan so\'rovlar', 'admin_pending')],
     [Markup.button.callback('👥 Foydalanuvchilar', 'admin_users')],
+    [Markup.button.callback('🔍 Foydalanuvchi qidirish', 'admin_search_user')],
     [Markup.button.callback('📦 Mahsulotlar', 'admin_products')],
+    [Markup.button.callback('➕ Mahsulot qo\'shish', 'admin_add_product')],
+    [Markup.button.callback('🗑 Mahsulotni o\'chirish', 'admin_delete_product')],
+    [Markup.button.callback('📁 Mahsulotga fayl biriktirish', 'admin_attach_file')],
+    [Markup.button.callback('🎟 Promo-kodlar', 'admin_promo')],
     [Markup.button.callback('📢 Hammaga xabar yuborish', 'admin_broadcast')]
   ]);
 }
@@ -450,11 +542,203 @@ bot.action('admin_products', async (ctx) => {
   if (products.length === 0) {
     return ctx.editMessageText('Mahsulotlar yo\'q.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', 'admin_menu')]]));
   }
-  const lines = products.map(p => `${p.icon || '📦'} <b>${esc(p.name)}</b> — ${p.isPremium === false ? 'Bepul' : money(p.price)}`);
+  const lines = products.map(p =>
+    `${p.icon || '📦'} <b>${esc(p.name)}</b> — ${p.isPremium === false ? 'Bepul' : money(p.price)} ${p.fileId ? '📁' : '⚠️ faylsiz'}`
+  );
   await ctx.editMessageText(
-    `📦 <b>Mahsulotlar (${products.length} ta)</b>\n━━━━━━━━━━━━━━━\n` + lines.join('\n'),
+    `📦 <b>Mahsulotlar (${products.length} ta)</b>\n📁 = fayl biriktirilgan, ⚠️ = fayl yo'q (qo'lda yuboriladi)\n━━━━━━━━━━━━━━━\n` + lines.join('\n'),
     { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', 'admin_menu')]]) }
   );
+});
+
+/* ========================= 📁 mahsulotga fayl biriktirish ========================= */
+bot.action('admin_attach_file', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await ctx.sendChatAction('typing');
+  const products = await listProducts();
+  if (products.length === 0) {
+    return ctx.editMessageText('Mahsulotlar yo\'q.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', 'admin_menu')]]));
+  }
+  const buttons = products.slice(0, 40).map(p => [
+    Markup.button.callback(`${p.fileId ? '📁' : '⚠️'} ${p.icon || '📦'} ${p.name}`, `attach_pick:${p.id}`)
+  ]);
+  buttons.push([Markup.button.callback('◀️ Orqaga', 'admin_menu')]);
+  await ctx.editMessageText(
+    '📁 <b>Qaysi mahsulotga fayl biriktiramiz?</b>\n\nTanlang, so\'ng faylni yuborasiz — u shu mahsulot sotib olinganda xaridorga avtomatik yuboriladi.',
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }
+  );
+});
+
+bot.action(/^attach_pick:(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const productId = ctx.match[1];
+  const product = await getProduct(productId);
+  if (!product) return ctx.answerCbQuery('Topilmadi', { show_alert: true });
+  ctx.session.flow = 'attach_file_wait';
+  ctx.session.attachProductId = productId;
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    `📁 <b>"${esc(product.name)}"</b> uchun endi faylni yuboring.\n\n<i>Faylni oddiy "Document" (📎) ko'rinishida yuboring, rasm sifatida emas — aks holda sifat pasayishi mumkin.</i>`,
+    { parse_mode: 'HTML', ...cancelKeyboard() }
+  );
+});
+
+bot.on('document', async (ctx) => {
+  if (!(isAdmin(ctx) && ctx.session.flow === 'attach_file_wait' && ctx.session.attachProductId)) return;
+  const productId = ctx.session.attachProductId;
+  const product = await getProduct(productId);
+  if (!product) {
+    ctx.session.flow = null;
+    ctx.session.attachProductId = null;
+    return ctx.reply('❌ Mahsulot topilmadi.');
+  }
+  product.fileId = ctx.message.document.file_id;
+  product.fileName = ctx.message.document.file_name || product.name;
+  await saveProductRecord(product);
+
+  ctx.session.flow = null;
+  ctx.session.attachProductId = null;
+
+  await ctx.replyWithHTML(
+    `✅ Fayl <b>"${esc(product.name)}"</b> ga biriktirildi!\n📄 ${esc(product.fileName)}\n\nEndi bu mahsulot sotib olinganda fayl avtomatik yuboriladi.`,
+    mainMenu()
+  );
+});
+
+/* ========================= 🔍 foydalanuvchi qidirish + balansni sozlash ========================= */
+bot.action('admin_search_user', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  ctx.session.flow = 'search_user_wait';
+  await ctx.editMessageText('🔍 Qidirilayotgan foydalanuvchi username\'ini yozing:', cancelKeyboard());
+});
+
+bot.action(/^adj_balance:(add|sub):(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const [, mode, username] = ctx.match;
+  ctx.session.flow = 'adjust_balance_wait';
+  ctx.session.adjustUsername = username;
+  ctx.session.adjustMode = mode;
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    `💰 <b>${esc(username)}</b> balansiga ${mode === 'add' ? "qo'shiladigan" : 'ayiriladigan'} summani yozing (so'm):`,
+    { parse_mode: 'HTML', ...cancelKeyboard() }
+  );
+});
+
+/* ========================= ➕ mahsulot qo'shish ========================= */
+bot.action('admin_add_product', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  ctx.session.newProduct = {};
+  const buttons = CATEGORIES.map(c => [Markup.button.callback(c, `newprod_cat:${c}`)]);
+  buttons.push([Markup.button.callback('✖️ Bekor qilish', 'cancel_flow')]);
+  await ctx.editMessageText('➕ <b>Yangi mahsulot — kategoriyani tanlang:</b>', { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+});
+
+bot.action(/^newprod_cat:(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  ctx.session.newProduct = { cat: ctx.match[1] };
+  ctx.session.flow = 'newprod_name';
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`📂 Kategoriya: <b>${esc(ctx.match[1])}</b>\n\n✍️ Mahsulot nomini yozing:`, { parse_mode: 'HTML', ...cancelKeyboard() });
+});
+
+/* ========================= 🗑 mahsulotni o'chirish ========================= */
+bot.action('admin_delete_product', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  const products = await listProducts();
+  if (products.length === 0) {
+    return ctx.editMessageText('Mahsulotlar yo\'q.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', 'admin_menu')]]));
+  }
+  const buttons = products.slice(0, 40).map(p => [Markup.button.callback(`🗑 ${p.icon || '📦'} ${p.name}`, `delprod_pick:${p.id}`)]);
+  buttons.push([Markup.button.callback('◀️ Orqaga', 'admin_menu')]);
+  await ctx.editMessageText('🗑 <b>Qaysi mahsulotni o\'chiramiz?</b>', { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+});
+
+bot.action(/^delprod_pick:(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const product = await getProduct(ctx.match[1]);
+  if (!product) return ctx.answerCbQuery('Topilmadi', { show_alert: true });
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    `⚠️ <b>"${esc(product.name)}"</b> ni butunlay o'chirishga ishonchingiz komilmi? Bu amalni ortga qaytarib bo'lmaydi.`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Ha, o\'chirish', `delprod_confirm:${product.id}`)],
+      [Markup.button.callback('✖️ Bekor qilish', 'cancel_flow')]
+    ]) }
+  );
+});
+
+bot.action(/^delprod_confirm:(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  await kvDelete('product:' + ctx.match[1]);
+  await ctx.answerCbQuery('O\'chirildi');
+  await ctx.editMessageText('✅ Mahsulot o\'chirildi.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Admin panel', 'admin_menu')]]));
+});
+
+/* ========================= 🎟 promo-kodlar ========================= */
+bot.action('admin_promo', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  const promos = await getPromoCodes();
+  const lines = promos.length
+    ? promos.map(p => `<code>${esc(p.code)}</code> — ${promoLabel(p)} ${p.active ? '✅' : '⛔️'}`).join('\n')
+    : "Hozircha promo-kod yo'q.";
+  const buttons = [[Markup.button.callback('➕ Yangi promo-kod', 'promo_add')]];
+  promos.forEach(p => buttons.push([
+    Markup.button.callback(`${p.active ? '⛔️ O\'chirish' : '✅ Faollashtirish'} ${p.code}`, `promo_toggle:${p.code}`),
+    Markup.button.callback('🗑', `promo_delete:${p.code}`)
+  ]));
+  buttons.push([Markup.button.callback('◀️ Orqaga', 'admin_menu')]);
+  await ctx.editMessageText(`🎟 <b>Promo-kodlar</b>\n━━━━━━━━━━━━━━━\n${lines}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+});
+
+bot.action('promo_add', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  ctx.session.newPromo = {};
+  ctx.session.flow = 'promo_code_wait';
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('🎟 Yangi promo-kod matnini yozing (masalan: YOZ2026):', cancelKeyboard());
+});
+
+bot.action(/^promo_toggle:(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const promos = await getPromoCodes();
+  const p = findPromo(promos, ctx.match[1]);
+  if (!p) return ctx.answerCbQuery('Topilmadi', { show_alert: true });
+  p.active = !p.active;
+  await savePromoCodes(promos);
+  await ctx.answerCbQuery(p.active ? 'Faollashtirildi' : 'O\'chirildi');
+  const lines = promos.map(x => `<code>${esc(x.code)}</code> — ${promoLabel(x)} ${x.active ? '✅' : '⛔️'}`).join('\n');
+  const buttons = [[Markup.button.callback('➕ Yangi promo-kod', 'promo_add')]];
+  promos.forEach(x => buttons.push([
+    Markup.button.callback(`${x.active ? '⛔️ O\'chirish' : '✅ Faollashtirish'} ${x.code}`, `promo_toggle:${x.code}`),
+    Markup.button.callback('🗑', `promo_delete:${x.code}`)
+  ]));
+  buttons.push([Markup.button.callback('◀️ Orqaga', 'admin_menu')]);
+  await ctx.editMessageText(`🎟 <b>Promo-kodlar</b>\n━━━━━━━━━━━━━━━\n${lines}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+});
+
+bot.action(/^promo_delete:(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const promos = await getPromoCodes();
+  const idx = promos.findIndex(p => p.code.toLowerCase() === ctx.match[1].toLowerCase());
+  if (idx !== -1) promos.splice(idx, 1);
+  await savePromoCodes(promos);
+  await ctx.answerCbQuery('O\'chirildi');
+  const lines = promos.length
+    ? promos.map(p => `<code>${esc(p.code)}</code> — ${promoLabel(p)} ${p.active ? '✅' : '⛔️'}`).join('\n')
+    : "Hozircha promo-kod yo'q.";
+  const buttons = [[Markup.button.callback('➕ Yangi promo-kod', 'promo_add')]];
+  promos.forEach(p => buttons.push([
+    Markup.button.callback(`${p.active ? '⛔️ O\'chirish' : '✅ Faollashtirish'} ${p.code}`, `promo_toggle:${p.code}`),
+    Markup.button.callback('🗑', `promo_delete:${p.code}`)
+  ]));
+  buttons.push([Markup.button.callback('◀️ Orqaga', 'admin_menu')]);
+  await ctx.editMessageText(`🎟 <b>Promo-kodlar</b>\n━━━━━━━━━━━━━━━\n${lines}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 });
 
 bot.action('admin_broadcast', async (ctx) => {
@@ -485,6 +769,30 @@ bot.action(/^broadcast_confirm$/, async (ctx) => {
 
 /* ========================= matnli xabarlarni qayta ishlash (topup summasi) ========================= */
 bot.on('text', async (ctx) => {
+  /* ---- admin support javobi (forward qilingan xabarga reply) ---- */
+  if (isAdmin(ctx) && ctx.message.reply_to_message) {
+    const mapRaw = await kvGet('supportmap:' + ctx.message.reply_to_message.message_id);
+    if (mapRaw) {
+      const targetId = mapRaw;
+      await bot.telegram.sendMessage(targetId, `💬 <b>Admin javobi:</b>\n\n${esc(ctx.message.text)}`, { parse_mode: 'HTML' }).catch(() => {});
+      return ctx.reply('✅ Javob yuborildi.');
+    }
+  }
+
+  if (ctx.session.flow === 'support_wait') {
+    ctx.session.flow = null;
+    await ctx.reply('✅ Xabaringiz adminga yuborildi. Tez orada javob berishadi.', mainMenu());
+    if (ADMIN_CHAT_ID) {
+      const sent = await bot.telegram.sendMessage(
+        ADMIN_CHAT_ID,
+        `🆘 <b>Yordam so'rovi</b>\n👤 @${esc(ctx.from.username || '—')} (<code>${ctx.from.id}</code>)\n\n${esc(ctx.message.text)}\n\n<i>Javob berish uchun shu xabarga "Reply" qiling.</i>`,
+        { parse_mode: 'HTML' }
+      ).catch(() => null);
+      if (sent) await kvSet('supportmap:' + sent.message_id, String(ctx.from.id));
+    }
+    return;
+  }
+
   if (ctx.session.flow === 'broadcast_wait' && isAdmin(ctx)) {
     const text = ctx.message.text;
     ctx.session.broadcastText = text;
@@ -496,6 +804,151 @@ bot.on('text', async (ctx) => {
         [Markup.button.callback('✖️ Bekor qilish', 'cancel_flow')]
       ])
     );
+  }
+
+  if (ctx.session.flow === 'buy_promo_wait') {
+    const code = ctx.message.text.trim();
+    const productId = ctx.session.pendingProductId;
+    const product = productId ? await getProduct(productId) : null;
+    if (!product) { ctx.session.flow = null; return ctx.reply('❌ Mahsulot topilmadi, qaytadan urinib ko\'ring.', mainMenu()); }
+    const promos = await getPromoCodes();
+    const promo = findPromo(promos, code);
+    if (!promo || !promo.active) {
+      return ctx.replyWithHTML(`❌ Bunday faol promo-kod topilmadi. Qaytadan yozing yoki bekor qiling.`, cancelKeyboard());
+    }
+    ctx.session.flow = null;
+    ctx.session.buyPromo = promo;
+    const discount = applyPromoDiscount(product.price, promo);
+    const finalPrice = Math.max(0, product.price - discount);
+    return ctx.replyWithHTML(
+      `🎟 Promo-kod qabul qilindi: <b>${esc(promo.code)}</b> (-${promoLabel(promo)})\n\n${product.icon || '📦'} ${product.name}\n💵 <s>${money(product.price)}</s> → <b>${money(finalPrice)}</b>\n\nXaridni tasdiqlaysizmi?`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Ha, sotib olaman', `confirm_buy:${product.id}`)],
+        [Markup.button.callback('✖️ Bekor qilish', 'cancel_flow')]
+      ])
+    );
+  }
+
+  /* ---- admin: foydalanuvchi qidirish ---- */
+  if (ctx.session.flow === 'search_user_wait' && isAdmin(ctx)) {
+    ctx.session.flow = null;
+    const uname = ctx.message.text.trim();
+    const user = await getUserByUsername(uname);
+    if (!user) return ctx.reply('❌ Bunday foydalanuvchi topilmadi.', mainMenu());
+    const orders = await listOrdersByUsername(user.username);
+    await ctx.replyWithHTML(
+      `👤 <b>${esc(user.username)}</b>\n` +
+      `💰 Balans: <b>${money(user.balance || 0)}</b>\n` +
+      `📲 Bot: ${user.telegramId ? `ulangan (<code>${user.telegramId}</code>)` : 'ulanmagan'}\n` +
+      `🧾 Buyurtmalar soni: ${orders.length}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('➕ Balans qo\'shish', `adj_balance:add:${user.username}`), Markup.button.callback('➖ Balans ayirish', `adj_balance:sub:${user.username}`)],
+        [Markup.button.callback('◀️ Admin panel', 'admin_menu')]
+      ])
+    );
+    return;
+  }
+
+  if (ctx.session.flow === 'adjust_balance_wait' && isAdmin(ctx)) {
+    const amount = parseInt((ctx.message.text || '').replace(/\D/g, ''), 10);
+    if (!amount || amount <= 0) {
+      return ctx.replyWithHTML('⚠️ Musbat son yuboring. Masalan: <code>50000</code>', cancelKeyboard());
+    }
+    const username = ctx.session.adjustUsername;
+    const mode = ctx.session.adjustMode;
+    ctx.session.flow = null; ctx.session.adjustUsername = null; ctx.session.adjustMode = null;
+
+    const user = await getUserByUsername(username);
+    if (!user) return ctx.reply('❌ Foydalanuvchi topilmadi.', mainMenu());
+    user.balance = Math.max(0, (user.balance || 0) + (mode === 'add' ? amount : -amount));
+    await saveUser(user);
+    await ctx.replyWithHTML(`✅ <b>${esc(user.username)}</b> balansi yangilandi: <b>${money(user.balance)}</b>`, mainMenu());
+    if (user.telegramId) {
+      bot.telegram.sendMessage(user.telegramId,
+        `💰 Admin balansingizni ${mode === 'add' ? "to'ldirdi" : 'kamaytirdi'}: ${mode === 'add' ? '+' : '-'}${money(amount)}\nYangi balans: <b>${money(user.balance)}</b>`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
+    return;
+  }
+
+  /* ---- admin: yangi mahsulot qo'shish (bosqichma-bosqich) ---- */
+  if (ctx.session.flow === 'newprod_name' && isAdmin(ctx)) {
+    ctx.session.newProduct.name = ctx.message.text.trim();
+    ctx.session.flow = 'newprod_price';
+    return ctx.replyWithHTML('💵 Narxini yozing (so\'m). Bepul bo\'lsa <code>0</code> yozing:', cancelKeyboard());
+  }
+  if (ctx.session.flow === 'newprod_price' && isAdmin(ctx)) {
+    const price = parseInt((ctx.message.text || '').replace(/\D/g, ''), 10) || 0;
+    ctx.session.newProduct.price = price;
+    ctx.session.flow = 'newprod_desc';
+    return ctx.replyWithHTML('📝 Qisqacha tavsif yozing:', cancelKeyboard());
+  }
+  if (ctx.session.flow === 'newprod_desc' && isAdmin(ctx)) {
+    ctx.session.newProduct.desc = ctx.message.text.trim();
+    ctx.session.flow = 'newprod_icon';
+    return ctx.replyWithHTML('🗺️ Emoji ikonka yuboring (masalan 🗺️), yoki <code>-</code> deb yozing:', cancelKeyboard());
+  }
+  if (ctx.session.flow === 'newprod_icon' && isAdmin(ctx)) {
+    const iconText = ctx.message.text.trim();
+    const p = ctx.session.newProduct;
+    const product = {
+      id: 'p' + Date.now(),
+      cat: p.cat,
+      name: p.name,
+      ver: '1.16–1.21',
+      price: p.price,
+      icon: iconText === '-' ? '📦' : iconText.slice(0, 4),
+      imageData: null,
+      desc: p.desc || "Tavsif kiritilmagan.",
+      isPremium: p.price > 0,
+      features: [],
+      fileId: null,
+      fileName: null
+    };
+    await saveProductRecord(product);
+    ctx.session.flow = null;
+    ctx.session.newProduct = null;
+    await ctx.replyWithHTML(
+      `✅ <b>"${esc(product.name)}"</b> qo'shildi!\n📂 ${esc(product.cat)} · 💵 ${product.price > 0 ? money(product.price) : 'Bepul'}\n\n📁 Faylni "Mahsulotga fayl biriktirish" orqali qo'shishni unutmang.`,
+      mainMenu()
+    );
+    return;
+  }
+
+  /* ---- admin: promo-kod yaratish ---- */
+  if (ctx.session.flow === 'promo_code_wait' && isAdmin(ctx)) {
+    const code = ctx.message.text.trim().toUpperCase();
+    const promos = await getPromoCodes();
+    if (findPromo(promos, code)) {
+      return ctx.replyWithHTML('⚠️ Bu kod allaqachon mavjud. Boshqa kod yozing:', cancelKeyboard());
+    }
+    ctx.session.newPromo = { code };
+    ctx.session.flow = null;
+    return ctx.replyWithHTML(
+      `🎟 Kod: <b>${esc(code)}</b>\n\nChegirma turini tanlang:`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('% Foizli chegirma', 'promo_type:percent')],
+        [Markup.button.callback('so\'m Belgilangan summa', 'promo_type:fixed')],
+        [Markup.button.callback('✖️ Bekor qilish', 'cancel_flow')]
+      ])
+    );
+  }
+  if (ctx.session.flow === 'promo_value_wait' && isAdmin(ctx)) {
+    const value = parseInt((ctx.message.text || '').replace(/\D/g, ''), 10);
+    if (!value || value <= 0) {
+      return ctx.replyWithHTML('⚠️ Musbat son yuboring:', cancelKeyboard());
+    }
+    const promo = ctx.session.newPromo;
+    promo.value = value;
+    promo.active = true;
+    const promos = await getPromoCodes();
+    promos.push(promo);
+    await savePromoCodes(promos);
+    ctx.session.flow = null;
+    ctx.session.newPromo = null;
+    await ctx.replyWithHTML(`✅ Promo-kod <b>${esc(promo.code)}</b> yaratildi: -${promoLabel(promo)}`, mainMenu());
+    return;
   }
 
   if (ctx.session.flow === 'topup_amount') {
@@ -537,6 +990,18 @@ bot.on('text', async (ctx) => {
       ).catch(() => {});
     }
   }
+});
+
+bot.action(/^promo_type:(percent|fixed)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  if (!ctx.session.newPromo) return ctx.answerCbQuery('Sessiya tugagan, qaytadan boshlang', { show_alert: true });
+  ctx.session.newPromo.type = ctx.match[1];
+  ctx.session.flow = 'promo_value_wait';
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    ctx.match[1] === 'percent' ? '📉 Necha foiz chegirma? (masalan 10):' : '💵 Necha so\'m chegirma?',
+    cancelKeyboard()
+  );
 });
 
 /* ========================= admin: topup tasdiqlash / rad etish ========================= */
