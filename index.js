@@ -20,6 +20,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const SITE_API_KEY = process.env.SITE_API_KEY;
 const PORT = process.env.PORT || 3000;
 const MIN_TOPUP = 5000;
 const MAX_TOPUP = 50000000;
@@ -1186,7 +1187,74 @@ bot.telegram.setMyCommands([
 
 /* ========================= server (webhook) ========================= */
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+
+/* saytdan (boshqa domendan) so'rov qabul qilish uchun CORS */
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+/* ========================= sayt -> bot: mahsulotni avtomatik yetkazish ========================= *
+ * Sayt "Bepul olish" / balansdan xarid qilinganda shu endpointga murojaat qiladi.
+ * Agar xaridor bot bilan ulangan bo'lsa va mahsulotga fayl biriktirilgan bo'lsa,
+ * fayl xaridorning Telegramiga darhol avtomatik yuboriladi.
+ */
+app.post('/api/deliver-product', async (req, res) => {
+  try {
+    if (!SITE_API_KEY || req.headers['x-api-key'] !== SITE_API_KEY) {
+      return res.status(401).json({ delivered: false, reason: 'unauthorized' });
+    }
+    const { username, productId } = req.body || {};
+    if (!username || !productId) {
+      return res.status(400).json({ delivered: false, reason: 'bad_request' });
+    }
+    const user = await getUserByUsername(username);
+    if (!user || !user.telegramId) {
+      notifyAdmins(
+        `⚠️ <b>Saytdan so'rov — foydalanuvchi botga ulanmagan</b>\n👤 ${esc(username)}\n🆔 <code>${esc(productId)}</code>\nMahsulotni qo'lda yetkazib berish kerak bo'lishi mumkin.`,
+        { parse_mode: 'HTML' }
+      );
+      return res.json({ delivered: false, reason: 'not_linked' });
+    }
+    const product = await getProduct(productId);
+    if (!product) {
+      notifyAdmins(
+        `⚠️ <b>Saytdan so'rov — mahsulot topilmadi</b>\n👤 ${esc(user.username)}\n🆔 <code>${esc(productId)}</code>`,
+        { parse_mode: 'HTML' }
+      );
+      return res.json({ delivered: false, reason: 'not_found' });
+    }
+    if (!product.fileId) {
+      notifyAdmins(
+        `⚠️ <b>Saytdan so'rov — fayl biriktirilmagan</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\nIltimos, foydalanuvchiga faylni qo'lda yuboring.`,
+        { parse_mode: 'HTML' }
+      );
+      return res.json({ delivered: false, reason: 'no_file' });
+    }
+    await bot.telegram.sendMessage(
+      user.telegramId,
+      `🎁 <b>"${esc(product.name)}"</b> saytdan olindi — faylingiz quyida:`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
+    await bot.telegram.sendDocument(user.telegramId, product.fileId, { caption: `📦 ${product.name}` });
+    notifyAdmins(
+      `🎁 <b>Saytdan mahsulot olindi</b>\n👤 ${esc(user.username)}\n📦 ${esc(product.name)}\n📁 Fayl avtomatik yuborildi.`,
+      { parse_mode: 'HTML' }
+    );
+    return res.json({ delivered: true });
+  } catch (e) {
+    console.error('deliver-product xatosi', e);
+    notifyAdmins(
+      `⚠️ <b>Saytdan so'rovda server xatoligi</b>\n🆔 <code>${esc(productId || '—')}</code>\n${esc(e && e.message ? e.message : String(e))}`,
+      { parse_mode: 'HTML' }
+    );
+    return res.status(500).json({ delivered: false, reason: 'server_error' });
+  }
+});
 
 const externalUrl = process.env.RENDER_EXTERNAL_URL;
 if (externalUrl) {
